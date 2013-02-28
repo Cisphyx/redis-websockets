@@ -38,6 +38,12 @@
 	 (((uint64_t)((p)[4])) << 32) + (((uint64_t)((p)[5])) << 40) +\
 	 (((uint64_t)((p)[6])) << 48) + (((uint64_t)((p)[7])) << 56))
 
+#define htonl64(p) {\
+	(char)(((p & ((uint64_t)0xff <<  0)) >>  0) & 0xff), (char)(((p & ((uint64_t)0xff <<  8)) >>  8) & 0xff), \
+	(char)(((p & ((uint64_t)0xff << 16)) >> 16) & 0xff), (char)(((p & ((uint64_t)0xff << 24)) >> 24) & 0xff), \
+	(char)(((p & ((uint64_t)0xff << 32)) >> 32) & 0xff), (char)(((p & ((uint64_t)0xff << 40)) >> 40) & 0xff), \
+	(char)(((p & ((uint64_t)0xff << 48)) >> 48) & 0xff), (char)(((p & ((uint64_t)0xff << 56)) >> 56) & 0xff) }
+
 static void setProtocolError(redisClient *c, int pos);
 
 /* To evaluate the output buffer size of a client we need to get size of
@@ -753,11 +759,42 @@ void freeClientsInAsyncFreeQueue(void) {
     }
 }
 
+int writeWebSocket(int fd, char *data, size_t size) {
+    char *frame = NULL;
+    int nwritten=0;
+
+    if (size <=125){
+        frame=zmalloc(size+2);
+        frame[0]='\x81';
+        frame[1]=size;
+        memcpy(frame+2, data, size);
+        nwritten = write(fd,frame,size+2)-2;
+    } else if (size > 125 && size <= 65536){
+        frame=zmalloc(size+4);
+        uint16_t sz16 = htons(size);
+        frame[0]='\x81';
+        frame[1]=126;
+        memcpy(frame + 2, &sz16, 2);
+        memcpy(frame + 4, data, size);
+        nwritten = write(fd,frame,size+4)-4;
+    } else {
+        frame=zmalloc(size+10);
+        char sz64[8] = htonl64(size);
+        frame[0]='\x81';
+        frame[1] = 127;
+        memcpy(frame + 2, sz64, 8);
+        memcpy(frame + 10, data, size);
+        nwritten = write(fd,frame,size+10)-10;
+    }
+
+    zfree(frame);
+    return nwritten;
+}
+
 void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     redisClient *c = privdata;
     int nwritten = 0, totwritten = 0, objlen;
     size_t objmem;
-    char *frame = NULL;
     robj *o;
     REDIS_NOTUSED(el);
     REDIS_NOTUSED(mask);
@@ -768,17 +805,10 @@ void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
                 /* Don't reply to a master */
                 nwritten = c->bufpos - c->sentlen;
             } else {
-                if (c->flags & REDIS_WEBSOCKET) {
-                    frame=zmalloc(c->bufpos - c->sentlen+2);
-                    frame[0]='\x81';
-                    frame[1]=c->bufpos - c->sentlen;
-                    memcpy(frame+2, c->buf+c->sentlen, c->bufpos-c->sentlen);
-                    nwritten = write(fd,frame,c->bufpos-c->sentlen+2);
-                    nwritten-=2;
-                    zfree(frame);
-                } else {
+                if (c->flags & REDIS_WEBSOCKET)
+                    nwritten = writeWebSocket(fd, c->buf+c->sentlen, c->bufpos-c->sentlen);
+                else
                     nwritten = write(fd,c->buf+c->sentlen,c->bufpos-c->sentlen);
-                }
                 if (nwritten <= 0) break;
             }
             c->sentlen += nwritten;
@@ -804,17 +834,10 @@ void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
                 /* Don't reply to a master */
                 nwritten = objlen - c->sentlen;
             } else {
-                if (c->flags & REDIS_WEBSOCKET) {
-                    frame=zmalloc(objlen-c->sentlen + 8);
-                    frame[0]='\x81';
-                    frame[1]=objlen-c->sentlen;
-                    memcpy(frame+2, ((char*)o->ptr)+c->sentlen, objlen-c->sentlen);
-                    nwritten = write(fd, frame,objlen-c->sentlen+2);
-                    nwritten-=2;
-                    zfree(frame);
-                } else {
+                if (c->flags & REDIS_WEBSOCKET) 
+                    nwritten = writeWebSocket(fd, ((char*)o->ptr)+c->sentlen, objlen-c->sentlen);
+                else 
                     nwritten = write(fd, ((char*)o->ptr)+c->sentlen,objlen-c->sentlen);
-                }
                 if (nwritten <= 0) break;
             }
             c->sentlen += nwritten;
