@@ -28,7 +28,15 @@
  */
 
 #include "redis.h"
+#include "sha1.h"
+#include "cencode.h"
 #include <sys/uio.h>
+
+#define ntohl64(p) \
+	((((uint64_t)((p)[0])) <<  0) + (((uint64_t)((p)[1])) <<  8) +\
+	 (((uint64_t)((p)[2])) << 16) + (((uint64_t)((p)[3])) << 24) +\
+	 (((uint64_t)((p)[4])) << 32) + (((uint64_t)((p)[5])) << 40) +\
+	 (((uint64_t)((p)[6])) << 48) + (((uint64_t)((p)[7])) << 56))
 
 static void setProtocolError(redisClient *c, int pos);
 
@@ -562,6 +570,22 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     acceptCommonHandler(cfd,0);
 }
 
+void acceptWebSocketHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    int cport, cfd;
+    char cip[128];
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(mask);
+    REDIS_NOTUSED(privdata);
+
+    cfd = anetTcpAccept(server.neterr, fd, cip, &cport);
+    if (cfd == AE_ERR) {
+        redisLog(REDIS_WARNING,"Accepting client websocket connection: %s", server.neterr);
+        return;
+    }
+    redisLog(REDIS_VERBOSE,"Accepted %s:%d", cip, cport);
+    acceptCommonHandler(cfd, REDIS_WEBSOCKET | REDIS_WEBSOCKET_INIT);
+}
+
 void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cfd;
     REDIS_NOTUSED(el);
@@ -733,6 +757,7 @@ void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     redisClient *c = privdata;
     int nwritten = 0, totwritten = 0, objlen;
     size_t objmem;
+    char *frame = NULL;
     robj *o;
     REDIS_NOTUSED(el);
     REDIS_NOTUSED(mask);
@@ -743,7 +768,17 @@ void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
                 /* Don't reply to a master */
                 nwritten = c->bufpos - c->sentlen;
             } else {
-                nwritten = write(fd,c->buf+c->sentlen,c->bufpos-c->sentlen);
+                if (c->flags & REDIS_WEBSOCKET) {
+                    frame=zmalloc(c->bufpos - c->sentlen+2);
+                    frame[0]='\x81';
+                    frame[1]=c->bufpos - c->sentlen;
+                    memcpy(frame+2, c->buf+c->sentlen, c->bufpos-c->sentlen);
+                    nwritten = write(fd,frame,c->bufpos-c->sentlen+2);
+                    nwritten-=2;
+                    zfree(frame);
+                } else {
+                    nwritten = write(fd,c->buf+c->sentlen,c->bufpos-c->sentlen);
+                }
                 if (nwritten <= 0) break;
             }
             c->sentlen += nwritten;
@@ -769,7 +804,17 @@ void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
                 /* Don't reply to a master */
                 nwritten = objlen - c->sentlen;
             } else {
-                nwritten = write(fd, ((char*)o->ptr)+c->sentlen,objlen-c->sentlen);
+                if (c->flags & REDIS_WEBSOCKET) {
+                    frame=zmalloc(objlen-c->sentlen + 8);
+                    frame[0]='\x81';
+                    frame[1]=objlen-c->sentlen;
+                    memcpy(frame+2, ((char*)o->ptr)+c->sentlen, objlen-c->sentlen);
+                    nwritten = write(fd, frame,objlen-c->sentlen+2);
+                    nwritten-=2;
+                    zfree(frame);
+                } else {
+                    nwritten = write(fd, ((char*)o->ptr)+c->sentlen,objlen-c->sentlen);
+                }
                 if (nwritten <= 0) break;
             }
             c->sentlen += nwritten;
@@ -842,7 +887,7 @@ int processInlineBuffer(redisClient *c) {
         }
         return REDIS_ERR;
     }
-
+    redisLog(REDIS_NOTICE, "Q %s", c->querybuf);
     /* Split the input buffer up to the \r\n */
     querylen = newline-(c->querybuf);
     argv = sdssplitlen(c->querybuf,querylen," ",1,&argc);
@@ -858,6 +903,7 @@ int processInlineBuffer(redisClient *c) {
     for (c->argc = 0, j = 0; j < argc; j++) {
         if (sdslen(argv[j])) {
             c->argv[c->argc] = createObject(REDIS_STRING,argv[j]);
+            redisLog(REDIS_NOTICE, "COMMAND %s", argv[j]);
             c->argc++;
         } else {
             sdsfree(argv[j]);
@@ -1051,6 +1097,149 @@ void processInputBuffer(redisClient *c) {
     }
 }
 
+void processWebSocketInputBuffer(redisClient *c) {
+    int has_mask, i;
+    uint64_t len;
+    const char *p=NULL;
+    unsigned char mask[4];
+    char *payload;
+    int argc, j;
+    sds *argv;
+    size_t querylen;
+
+    if (sdslen(c->querybuf) < 8) {
+        return;
+    }
+    has_mask = c->querybuf[1] & 0x80 ? 1:0;
+
+    len = c->querybuf[1] & 0x7f;
+    if (len <= 125) {
+        p = c->querybuf+2+(has_mask ? 4:0);
+        if (has_mask) memcpy(&mask, c->querybuf+2, sizeof(mask));
+    } else if (len==126) {
+        uint16_t sz16;
+        memcpy(&sz16, c->querybuf+2, sizeof(uint16_t));
+        len=ntohs(sz16);
+        p = c->querybuf+4+(has_mask ? 4:0);
+        if (has_mask) memcpy(&mask, c->querybuf+4, sizeof(mask));
+    } else if (len==127) {
+        redisLog(REDIS_NOTICE, "LARGE");
+        len=ntohl64(c->querybuf+2);
+        p = c->querybuf+10+(has_mask ? 4:0);
+        if (has_mask) memcpy(&mask, c->querybuf+10, sizeof(mask));
+    } else {
+        redisLog(REDIS_WARNING, "BAD WEBSOCKET PAYLOAD LENGTH");
+    }
+
+    if (len > sdslen(c->querybuf) - (p - c->querybuf)){
+        return;
+    }
+
+    payload=zmalloc(len);
+    memcpy(payload, p, len);
+    for (i=0; i<len && has_mask; i++)
+        payload[i]=(unsigned char)payload[i] ^ mask[i%4];
+
+//    if (c->querybuf[0] & 0x80)
+//        redisLog(REDIS_NOTICE, "COMPLETE");
+    c->querybuf = sdsrange(c->querybuf,sdslen(c->querybuf),-1);
+
+    char *newline = strstr(payload,"\r\n");
+    querylen = newline-(payload);
+    argv = sdssplitlen(payload,querylen," ",1,&argc);
+
+    /* Setup argv array on client structure */
+    if (c->argv) zfree(c->argv);
+    c->argv = zmalloc(sizeof(robj*)*argc);
+
+    /* Create redis objects for all arguments. */
+    for (c->argc = 0, j = 0; j < argc; j++) {
+        if (sdslen(argv[j])) {
+            c->argv[c->argc] = createObject(REDIS_STRING,argv[j]);
+            c->argc++;
+        } else {
+            sdsfree(argv[j]);
+        }
+    }
+    zfree(argv);
+    zfree(payload);
+
+    if (c->argc == 0) {
+        resetClient(c);
+    } else {
+        /* Only reset the client when the command was executed. */
+        if (processCommand(c) == REDIS_OK)
+            resetClient(c);
+    }
+}
+
+void processWebSocketHandshake(redisClient *c) {
+    int pos;
+    char sha1_handshake[40];
+    char *buffer=NULL, *p, *line, *key=NULL;
+    size_t handshake_sz=0, sz, key_sz=0, shabuffer_sz=0;
+	unsigned char *shabuffer, sha1_output[40], digest[20];
+	char magic[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+	SHA1_CTX ctx;
+	base64_encodestate b64_ctx;
+
+    line=strtok(c->querybuf, "\n");
+    while (line){
+        if (strncmp(line, "Sec-WebSocket-Key: ", 19)==0){
+            key=zmalloc(strlen(line)-19);
+            strncpy(key, line+19, strlen(line)-20);
+
+	        key_sz = strlen(key);
+            shabuffer_sz = key_sz + sizeof(magic) - 1;
+
+	        shabuffer = zmalloc(shabuffer_sz);
+	        memcpy(shabuffer, key, key_sz);
+        	memcpy(shabuffer+key_sz, magic, sizeof(magic)-1);
+
+	        SHA1Init(&ctx);
+        	SHA1Update(&ctx, shabuffer, shabuffer_sz);
+        	SHA1Final(digest, &ctx);
+
+            memcpy(sha1_output, digest, 20);
+        	base64_init_encodestate(&b64_ctx);
+        	pos = base64_encode_block((const char*)sha1_output, 20, sha1_handshake, &b64_ctx);
+        	base64_encode_blockend(sha1_handshake + pos, &b64_ctx);
+
+        	handshake_sz = strlen(sha1_handshake);
+        	zfree(shabuffer);
+            zfree(key);
+            break;
+        }
+        line=strtok(NULL, "\n");
+    }
+
+    if (!handshake_sz)
+        return;
+
+	char template[] = "HTTP/1.1 101 Switching Protocols\r\n"
+		"Upgrade: websocket\r\n"
+		"Connection: Upgrade\r\n"
+		"Sec-WebSocket-Accept: ";
+	char templateEnd[] = "\r\n\r\n";	
+
+    sz = sizeof(template)-1 + handshake_sz-1 + sizeof(templateEnd)-1;
+	p = buffer = zmalloc(sz);
+
+	memcpy(p, template, sizeof(template)-1);
+	p += sizeof(template)-1;
+	memcpy(p, &sha1_handshake[0], handshake_sz-1);
+	p += handshake_sz-1;
+	memcpy(p, templateEnd, sizeof(templateEnd));
+	p += sizeof(templateEnd)-1;
+
+	write(c->fd, buffer, sz);
+    c->flags &= ~REDIS_WEBSOCKET_INIT;
+    zfree(buffer);
+
+    c->querybuf = sdsrange(c->querybuf,sdslen(c->querybuf),-1);
+	return;
+}
+
 void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     redisClient *c = (redisClient*) privdata;
     int nread, readlen;
@@ -1109,7 +1298,17 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
         freeClient(c);
         return;
     }
-    processInputBuffer(c);
+
+
+    if (c->flags & REDIS_WEBSOCKET) {
+        if (c->flags & REDIS_WEBSOCKET_INIT) 
+            processWebSocketHandshake(c);
+        else
+            processWebSocketInputBuffer(c);
+    } else {
+        processInputBuffer(c);
+    }
+
     server.current_client = NULL;
 }
 
